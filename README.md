@@ -91,7 +91,7 @@ Calls `fs.open(path, "r")` and reads the `fd` effectively the same as `fromFd()`
 
 See also `openPromise()` to get `Promise` semantics.
 
-`options` may be omitted or `null`. The defaults are `{autoClose: true, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false}`.
+`options` may be omitted or `null`. The defaults are `{autoClose: true, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, validatePathIdentities: true}`.
 
 `autoClose` is effectively equivalent to:
 
@@ -132,6 +132,19 @@ When `strictFileNames` is `true` and `decodeStrings` is `true`,
 entries with backslashes in their file names will result in an error. See `validateFileName()`.
 When `decodeStrings` is `false`, `strictFileNames` has no effect.
 
+`validatePathIdentities` defaults to `true` and only takes effect when `decodeStrings` is also `true`.
+When enabled, every entry's cross-platform writable-path identity is computed
+(see `getPathIdentity()` and `getPathIdentitySegments()`) and the whole archive is checked for
+names that would collide on disk after the case folding, Unicode normalization,
+trailing-dot/space stripping, or reserved-name handling applied by common file systems.
+Names that are not portable (for example Windows reserved names such as `CON`,
+control characters, or trailing spaces/dots) and any two entries that would extract to the
+same target path (including a file sharing its name with another entry's directory)
+produce an error before the second entry is emitted, so a malicious entry can never overwrite
+an already-scanned entry.
+Set this to `false` only if you do not extract entries to a real file system and perform your
+own name handling; in that case `entry.pathIdentity` and `entry.pathIdentitySegments` are `null`.
+
 The `callback` is given the arguments `(err, zipfile)`.
 An `err` is provided if the End of Central Directory Record cannot be found, or if its metadata appears malformed.
 This kind of error usually indicates that this is not a zip file.
@@ -145,7 +158,7 @@ so the fd cannot be an open socket or any other fd that does not support random 
 
 See also `fromFdPromise()` to get `Promise` semantics.
 
-`options` may be omitted or `null`. The defaults are `{autoClose: false, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false}`.
+`options` may be omitted or `null`. The defaults are `{autoClose: false, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, validatePathIdentities: true}`.
 
 See `open()` for the meaning of the options and callback.
 
@@ -160,7 +173,7 @@ If a `ZipFile` is acquired from this method,
 it will never emit the `close` event,
 and calling `close()` is not necessary.
 
-`options` may be omitted or `null`. The defaults are `{lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false}`.
+`options` may be omitted or `null`. The defaults are `{lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, validatePathIdentities: true}`.
 
 See `open()` for the meaning of the options and callback.
 The `autoClose` option is ignored for this method.
@@ -176,7 +189,7 @@ The `reader` parameter must be of a type that is a subclass of
 [RandomAccessReader](#class-randomaccessreader) that implements the required methods.
 The `totalSize` is a Number and indicates the total file size of the zip file.
 
-`options` may be omitted or `null`. The defaults are `{autoClose: true, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false}`.
+`options` may be omitted or `null`. The defaults are `{autoClose: true, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, validatePathIdentities: true}`.
 
 See `open()` for the meaning of the options and callback.
 
@@ -267,6 +280,36 @@ if (errorMessage != null) throw new Error(errorMessage);
 This function is automatically run for each entry, as long as `decodeStrings` is `true`.
 See `open()`, `strictFileNames`, and `Event: "entry"` for more information.
 
+### validatePortableFileName(fileName)
+
+Returns `null` or a `String` error message describing why `fileName` cannot be written
+safely on every supported platform.
+`validateFileName()` only catches literal traversal such as `".."`; this function additionally
+rejects empty path segments, control characters and the characters `<>:"|?*`,
+path segments ending in a dot or space (which Windows strips silently),
+and Windows reserved device names such as `CON`, `NUL`, `COM1`, and `LPT1`
+(including with an extension, e.g. `nul.txt`).
+
+This function is automatically run for each entry when both `decodeStrings` and
+`validatePathIdentities` are `true` (the default).
+
+### getPathIdentitySegments(fileName)
+
+Returns an `Array` of normalized path segments representing where `fileName` would land
+if extracted to a case-insensitive, normalization-insensitive file system.
+Each segment is Unicode-normalized to NFC and lower-cased;
+the trailing slash of a directory entry does not produce an extra segment.
+The original `fileName` is never modified.
+Two entries with the same segments cannot coexist on disk without one overwriting the other,
+and a file entry whose segments are a prefix of another entry's segments collides with that
+entry's implicit parent directory.
+
+### getPathIdentity(fileName)
+
+Convenience wrapper that returns `getPathIdentitySegments(fileName).join("/")`.
+For example, `getPathIdentity("Dir/File.TXT") === "dir/file.txt"`,
+and the NFC and NFD spellings of an accented name return the same identity.
+
 ### parseExtraFields(extraFieldBuffer)
 
 This function is used internally by yauzl to compute [`entry.extraFields`](#extrafields).
@@ -291,6 +334,8 @@ See `open()` and `readEntry()` for when this event is emitted.
 See also `eachEntry()` for an async iterator alternative to this event.
 
 If `decodeStrings` is `true`, entries emitted via this event have already passed file name validation.
+If `validatePathIdentities` is also `true` (the default), they have also passed portability
+and archive-level collision checks, and their `pathIdentity` / `pathIdentitySegments` fields are populated.
 See `validateFileName()` and `open()` for more information.
 
 If `validateEntrySizes` is `true` and this entry's `compressionMethod` is `0` (stored without compression),
@@ -594,6 +639,20 @@ If this field would contain unsafe characters, yauzl emits an error instead of a
 If `decodeStrings` is `false` (see `open()`), this field is the undecoded `Buffer` instead of a decoded `String`.
 Therefore, `generalPurposeBitFlag` and any Info-ZIP Unicode Path Extra Field are ignored.
 Furthermore, no automatic file name validation is performed for this file name.
+
+#### pathIdentity and pathIdentitySegments
+
+`pathIdentity` is a `String` and `pathIdentitySegments` is an `Array` of `String`s.
+They hold the cross-platform writable-path identity of this entry as produced by
+[`getPathIdentity()`](#getpathidentity-filename) and
+[`getPathIdentitySegments()`](#getpathidentitysegments-filename).
+The original `fileName` is left untouched; these normalized fields exist only to make
+each entry's on-disk target visible at the archive level.
+Every identity in the archive is unique (modulo repeated directory declarations),
+and yauzl emits an error instead of an entry if this entry would collide with an
+earlier one through case folding, Unicode normalization, or a file/directory name clash.
+
+Both fields are `null` when `decodeStrings` is `false` or when `validatePathIdentities` is `false`.
 
 #### extraFields
 

@@ -2,6 +2,7 @@ var yauzl = require("../");
 var zip64 = require("./zip64");
 var rangeTest = require("./range-test");
 var errorsTest = require("./errors");
+var pathSecurityTest = require("./path-security");
 var fs = require("fs");
 var path = require("path");
 var Pend = require("pend");
@@ -444,6 +445,9 @@ pend.go(rangeTest.runTest);
 
 // Test error propagation.
 pend.go(errorsTest.runTest);
+
+// Cross-platform path identity and collision detection.
+pend.go(pathSecurityTest.runTest);
 
 // Make sure the examples run without crashing.
 pend.go(function(cb) {

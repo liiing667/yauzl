@@ -22,6 +22,9 @@ exports.fromRandomAccessReaderPromise = fromRandomAccessReaderPromise;
 exports.dosDateTimeToDate = dosDateTimeToDate;
 exports.getFileNameLowLevel = getFileNameLowLevel;
 exports.validateFileName = validateFileName;
+exports.validatePortableFileName = validatePortableFileName;
+exports.getPathIdentitySegments = getPathIdentitySegments;
+exports.getPathIdentity = getPathIdentity;
 exports.parseExtraFields = parseExtraFields;
 exports.ZipFile = ZipFile;
 exports.Entry = Entry;
@@ -72,6 +75,7 @@ function open(path, options, callback) {
   if (options.decodeStrings == null) options.decodeStrings = true;
   if (options.validateEntrySizes == null) options.validateEntrySizes = true;
   if (options.strictFileNames == null) options.strictFileNames = false;
+  if (options.validatePathIdentities == null) options.validatePathIdentities = true;
   if (callback == null) callback = defaultCallback;
   fs.open(path, "r", function(err, fd) {
     if (err) return callback(err);
@@ -93,6 +97,7 @@ function fromFd(fd, options, callback) {
   if (options.decodeStrings == null) options.decodeStrings = true;
   if (options.validateEntrySizes == null) options.validateEntrySizes = true;
   if (options.strictFileNames == null) options.strictFileNames = false;
+  if (options.validatePathIdentities == null) options.validatePathIdentities = true;
   if (callback == null) callback = defaultCallback;
   fs.fstat(fd, function(err, stats) {
     if (err) return callback(err);
@@ -112,6 +117,7 @@ function fromBuffer(buffer, options, callback) {
   if (options.decodeStrings == null) options.decodeStrings = true;
   if (options.validateEntrySizes == null) options.validateEntrySizes = true;
   if (options.strictFileNames == null) options.strictFileNames = false;
+  if (options.validatePathIdentities == null) options.validatePathIdentities = true;
   var reader = new fd_slicer.BufferSlicer(buffer);
   fromRandomAccessReader(reader, buffer.length, options, callback);
 }
@@ -128,6 +134,7 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
   var decodeStrings = !!options.decodeStrings;
   if (options.validateEntrySizes == null) options.validateEntrySizes = true;
   if (options.strictFileNames == null) options.strictFileNames = false;
+  if (options.validatePathIdentities == null) options.validatePathIdentities = true;
   if (callback == null) callback = defaultCallback;
   if (typeof totalSize !== "number") throw new Error("expected totalSize parameter to be a number");
   if (totalSize > Number.MAX_SAFE_INTEGER) {
@@ -213,7 +220,7 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
           // 48 - offset of start of central directory with respect to the starting disk number     8 bytes
           centralDirectoryOffset = readUInt64LE(zip64EocdrBuffer, 48);
           // 56 - zip64 extensible data sector                                (variable size)
-          return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
+          return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames, options.validatePathIdentities));
         });
       }
 
@@ -221,7 +228,7 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
       if (diskNumber !== 0) {
         return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
       }
-      return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
+      return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames, options.validatePathIdentities));
 
     }
 
@@ -231,7 +238,7 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
 }
 
 util.inherits(ZipFile, EventEmitter);
-function ZipFile(reader, centralDirectoryOffset, fileSize, entryCount, comment, autoClose, lazyEntries, decodeStrings, validateEntrySizes, strictFileNames) {
+function ZipFile(reader, centralDirectoryOffset, fileSize, entryCount, comment, autoClose, lazyEntries, decodeStrings, validateEntrySizes, strictFileNames, validatePathIdentities) {
   var self = this;
   EventEmitter.call(self);
   self.reader = reader;
@@ -253,9 +260,14 @@ function ZipFile(reader, centralDirectoryOffset, fileSize, entryCount, comment, 
   self.decodeStrings = !!decodeStrings;
   self.validateEntrySizes = !!validateEntrySizes;
   self.strictFileNames = !!strictFileNames;
+  self.validatePathIdentities = validatePathIdentities !== false;
   self.isOpen = true;
   self.emittedError = false;
   self.hasEachEntryBeenCalled = false;
+  // Maps each normalized path identity to the first entry that claimed it.
+  // This is what makes writable target paths visible at the archive level so
+  // that colliding entries can fail closed instead of overwriting each other.
+  self.claimedPathIdentities = Object.create(null);
 
   if (!self.lazyEntries) self._readEntry();
 }
@@ -263,6 +275,35 @@ ZipFile.prototype.close = function() {
   if (!this.isOpen) return;
   this.isOpen = false;
   this.reader.unref();
+};
+
+// Register every path identity that this entry would occupy if extracted.
+// Implicit parent directories are claimed too, so an entry like "a/b" cannot
+// collide with an existing file entry "a" even without an explicit "a/" entry.
+// Returns an error message on a collision, or null when all identities are free.
+ZipFile.prototype._claimPathIdentity = function(entry) {
+  var self = this;
+  var isDirectory = entry.fileName.length > 0 && entry.fileName.charAt(entry.fileName.length - 1) === "/";
+  var claimedPath = "";
+  for (var i = 0; i < entry.pathIdentitySegments.length; i++) {
+    claimedPath = claimedPath === "" ? entry.pathIdentitySegments[i] : claimedPath + "/" + entry.pathIdentitySegments[i];
+    var existing = self.claimedPathIdentities[claimedPath];
+    var atEntryEndpoint = i === entry.pathIdentitySegments.length - 1;
+    if (existing != null) {
+      if (existing.isDirectory && (!atEntryEndpoint || isDirectory)) {
+        // Re-declaring the same directory (explicitly or via an implicit parent)
+        // does not overwrite any data, so it is harmless.
+        continue;
+      }
+      return "file name collision: " + entry.fileName + " and " + existing.fileName + " both extract to the same path: " + claimedPath;
+    }
+    // An intermediate segment is an implicit parent directory.
+    self.claimedPathIdentities[claimedPath] = {
+      fileName: entry.fileName,
+      isDirectory: !atEntryEndpoint || isDirectory,
+    };
+  }
+  return null;
 };
 
 function emitErrorAndAutoClose(self, err) {
@@ -361,9 +402,24 @@ ZipFile.prototype._readEntry = function() {
         entry.fileName = getFileNameLowLevel(entry.generalPurposeBitFlag, entry.fileNameRaw, entry.extraFields, self.strictFileNames);
         var errorMessage = validateFileName(entry.fileName);
         if (errorMessage != null) return emitErrorAndAutoClose(self, new Error(errorMessage));
+        // Compute the cross-platform writable-path identity and make sure no
+        // other entry can land on the same target path. See validatePortableFileName().
+        if (self.validatePathIdentities) {
+          var portableErrorMessage = validatePortableFileName(entry.fileName);
+          if (portableErrorMessage != null) return emitErrorAndAutoClose(self, new Error(portableErrorMessage));
+          entry.pathIdentitySegments = getPathIdentitySegments(entry.fileName);
+          entry.pathIdentity = getPathIdentity(entry.fileName);
+          var collisionErrorMessage = self._claimPathIdentity(entry);
+          if (collisionErrorMessage != null) return emitErrorAndAutoClose(self, new Error(collisionErrorMessage));
+        } else {
+          entry.pathIdentitySegments = null;
+          entry.pathIdentity = null;
+        }
       } else {
         entry.fileComment = entry.fileCommentRaw;
         entry.fileName = entry.fileNameRaw;
+        entry.pathIdentitySegments = null;
+        entry.pathIdentity = null;
       }
       // Maintain API compatibility. See https://github.com/thejoshwolfe/yauzl/issues/47
       entry.comment = entry.fileComment;
@@ -880,6 +936,70 @@ function validateFileName(fileName) {
   }
   // all good
   return null;
+}
+
+// Characters that are illegal in Windows file names, plus control characters.
+// A file name containing any of these cannot be written portably.
+var portableInvalidCharacterRegexp = /[\u0000-\u001f<>:"|?*]/;
+// Base names (ignoring any extension) that Windows treats as device names
+// regardless of casing, e.g. "CON", "nul.txt", "COM1.dat".
+var windowsReservedNameRegexp = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$/;
+
+// Returns null or a String error message describing why fileName is not safe
+// to write on every supported platform. validateFileName() only catches literal
+// path traversal; this additionally rejects names that collide after the case
+// folding, Unicode normalization, trailing-dot/space stripping, or reserved-name
+// handling that Windows and macOS file systems apply transparently.
+function validatePortableFileName(fileName) {
+  if (fileName === "") return "empty file name";
+  var segments = fileName.split("/");
+  // A trailing slash marks a directory and produces a final empty segment.
+  if (segments[segments.length - 1] === "") segments.pop();
+  if (segments.length === 0) return "empty file name: " + fileName;
+  for (var i = 0; i < segments.length; i++) {
+    var segment = segments[i];
+    if (segment === "") {
+      return "empty path segment in file name: " + fileName;
+    }
+    if (portableInvalidCharacterRegexp.test(segment)) {
+      return "invalid characters in file name: " + fileName;
+    }
+    if (segment.charAt(segment.length - 1) === "." || segment.charAt(segment.length - 1) === " ") {
+      // Windows silently strips trailing dots and spaces, which would change
+      // the on-disk name and enable collisions against other entries.
+      return "trailing dot or space in file name segment: " + fileName;
+    }
+    if (windowsReservedNameRegexp.test(segment.toLowerCase())) {
+      return "windows reserved name in file name: " + fileName;
+    }
+  }
+  return null;
+}
+
+// Fold a single path segment into the form by which a case-insensitive,
+// normalization-insensitive file system would identify it. The original name
+// is never modified; this normalized copy is only used for collision checks.
+function normalizePathIdentitySegment(segment) {
+  if (typeof segment.normalize === "function") {
+    // Normalize first so e.g. NFD and NFC spellings compare equal.
+    segment = segment.normalize("NFC");
+  }
+  return segment.toLowerCase();
+}
+
+// Returns the array of normalized path segments that identify where an entry
+// would land if extracted. Two entries with equal segment arrays (or where one
+// entry's segments are a prefix of the other's while the shorter one is a file)
+// cannot coexist on disk without one overwriting the other.
+function getPathIdentitySegments(fileName) {
+  var segments = fileName.split("/");
+  if (segments[segments.length - 1] === "") segments.pop();
+  return segments.map(normalizePathIdentitySegment);
+}
+
+// Convenience form of getPathIdentitySegments() joined back into a path string.
+function getPathIdentity(fileName) {
+  return getPathIdentitySegments(fileName).join("/");
 }
 
 function parseExtraFields(extraFieldBuffer) {
