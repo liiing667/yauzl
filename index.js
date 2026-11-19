@@ -142,7 +142,11 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
   // the last field of the eocdr is a variable-length comment.
   // the comment size is encoded in a 2-byte field in the eocdr, which we can't find without trudging backwards through the comment to find it.
   // as a consequence of this design decision, it's possible to have ambiguous zip file metadata if a coherent eocdr was in the comment.
-  // we search backwards for a eocdr signature, and hope that whoever made the zip file was smart enough to forbid the eocdr signature in the comment.
+  // to keep the chain from the eocdr to the central directory uniquely interpretable,
+  // we require that exactly one eocdr signature in the file is "plausible",
+  // meaning its comment length field exactly covers the rest of the file.
+  // if a second plausible eocdr hides in the comment of the real one (a polyglot),
+  // different parsers would select different central directories, so we fail closed.
   var eocdrWithoutCommentSize = 22;
   var zip64EocdlSize = 20; // Zip64 end of central directory locator
   var maxCommentSize = 0xffff; // 2-byte size
@@ -151,82 +155,92 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
   var bufferReadStart = totalSize - buffer.length;
   readAndAssertNoEof(reader, buffer, 0, bufferSize, bufferReadStart, function(err) {
     if (err) return callback(err);
+    var eocdrOffset = -1; // relative to buffer
     for (var i = bufferSize - eocdrWithoutCommentSize; i >= 0; i -= 1) {
       if (buffer.readUInt32LE(i) !== 0x06054b50) continue;
-      // found eocdr
-      var eocdrBuffer = buffer.subarray(i);
-
-      // 0 - End of central directory signature = 0x06054b50
-      // 4 - Number of this disk
-      var diskNumber = eocdrBuffer.readUInt16LE(4);
-      // 6 - Disk where central directory starts
-      // 8 - Number of central directory records on this disk
-      // 10 - Total number of central directory records
-      var entryCount = eocdrBuffer.readUInt16LE(10);
-      // 12 - Size of central directory (bytes)
-      // 16 - Offset of start of central directory, relative to start of archive
-      var centralDirectoryOffset = eocdrBuffer.readUInt32LE(16);
-      // 20 - Comment length
-      var commentLength = eocdrBuffer.readUInt16LE(20);
-      var expectedCommentLength = eocdrBuffer.length - eocdrWithoutCommentSize;
-      if (commentLength !== expectedCommentLength) {
-        return callback(new Error("Invalid comment length. Expected: " + expectedCommentLength + ". Found: " + commentLength + ". Are there extra bytes at the end of the file? Or is the end of central dir signature `PK☺☻` in the comment?"));
+      var candidateCommentLength = buffer.readUInt16LE(i + 20);
+      var candidateExpectedCommentLength = bufferSize - i - eocdrWithoutCommentSize;
+      if (eocdrOffset === -1) {
+        // this is the eocdr signature closest to the end of the file.
+        if (candidateCommentLength !== candidateExpectedCommentLength) {
+          return callback(new Error("Invalid comment length. Expected: " + candidateExpectedCommentLength + ". Found: " + candidateCommentLength + ". Are there extra bytes at the end of the file? Or is the end of central dir signature `PK☺☻` in the comment?"));
+        }
+        eocdrOffset = i;
+      } else if (candidateCommentLength === candidateExpectedCommentLength) {
+        // a second, earlier eocdr also claims to end exactly at the end of the file.
+        // this archive is a polyglot: scanners that stop at different signatures
+        // would select different central directories, so refuse to pick one.
+        return callback(new Error("ambiguous zip file: multiple plausible end of central directory records found at offsets " + (bufferReadStart + i) + " and " + (bufferReadStart + eocdrOffset) + ". refusing to choose between ambiguous central directories."));
       }
-      // 22 - Comment
-      // the encoding is always cp437.
-      var comment = decodeStrings ? decodeBuffer(eocdrBuffer.subarray(22), false)
-                                  : eocdrBuffer.subarray(22);
+    }
+    if (eocdrOffset === -1) {
+      // Not a zip file.
+      return callback(new Error("End of central directory record signature not found. Either not a zip file, or file is truncated."));
+    }
+    var i = eocdrOffset;
+    // found eocdr
+    var eocdrBuffer = buffer.subarray(i);
 
-      // Look for a Zip64 end of central directory locator
-      if (i - zip64EocdlSize >= 0 && buffer.readUInt32LE(i - zip64EocdlSize) === 0x07064b50) {
-        // ZIP64 format
-        var zip64EocdlBuffer = buffer.subarray(i - zip64EocdlSize, i - zip64EocdlSize + zip64EocdlSize);
-        // 0 - zip64 end of central dir locator signature = 0x07064b50
-        // 4 - number of the disk with the start of the zip64 end of central directory
-        // 8 - relative offset of the zip64 end of central directory record
-        var zip64EocdrOffset = readUInt64LE(zip64EocdlBuffer, 8);
-        // 16 - total number of disks
+    // 0 - End of central directory signature = 0x06054b50
+    // 4 - Number of this disk
+    var diskNumber = eocdrBuffer.readUInt16LE(4);
+    // 6 - Disk where central directory starts
+    // 8 - Number of central directory records on this disk
+    // 10 - Total number of central directory records
+    var entryCount = eocdrBuffer.readUInt16LE(10);
+    // 12 - Size of central directory (bytes)
+    // 16 - Offset of start of central directory, relative to start of archive
+    var centralDirectoryOffset = eocdrBuffer.readUInt32LE(16);
+    // 22 - Comment
+    // the encoding is always cp437.
+    var comment = decodeStrings ? decodeBuffer(eocdrBuffer.subarray(22), false)
+                                : eocdrBuffer.subarray(22);
 
-        // ZIP64 end of central directory record
-        var zip64EocdrBuffer = newBuffer(56);
-        return readAndAssertNoEof(reader, zip64EocdrBuffer, 0, zip64EocdrBuffer.length, zip64EocdrOffset, function(err) {
-          if (err) return callback(err);
+    // Look for a Zip64 end of central directory locator
+    if (i - zip64EocdlSize >= 0 && buffer.readUInt32LE(i - zip64EocdlSize) === 0x07064b50) {
+      // ZIP64 format
+      var zip64EocdlBuffer = buffer.subarray(i - zip64EocdlSize, i - zip64EocdlSize + zip64EocdlSize);
+      // 0 - zip64 end of central dir locator signature = 0x07064b50
+      // 4 - number of the disk with the start of the zip64 end of central directory
+      // 8 - relative offset of the zip64 end of central directory record
+      var zip64EocdrOffset = readUInt64LE(zip64EocdlBuffer, 8);
+      // 16 - total number of disks
 
-          // 0 - zip64 end of central dir signature                           4 bytes  (0x06064b50)
-          if (zip64EocdrBuffer.readUInt32LE(0) !== 0x06064b50) {
-            return callback(new Error("invalid zip64 end of central directory record signature"));
-          }
-          // 4 - size of zip64 end of central directory record                8 bytes
-          // 12 - version made by                                             2 bytes
-          // 14 - version needed to extract                                   2 bytes
-          // 16 - number of this disk                                         4 bytes
-          diskNumber = zip64EocdrBuffer.readUInt32LE(16);
-          if (diskNumber !== 0) {
-            // Check this only after zip64 overrides. See #118.
-            return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
-          }
-          // 20 - number of the disk with the start of the central directory  4 bytes
-          // 24 - total number of entries in the central directory on this disk         8 bytes
-          // 32 - total number of entries in the central directory            8 bytes
-          entryCount = readUInt64LE(zip64EocdrBuffer, 32);
-          // 40 - size of the central directory                               8 bytes
-          // 48 - offset of start of central directory with respect to the starting disk number     8 bytes
-          centralDirectoryOffset = readUInt64LE(zip64EocdrBuffer, 48);
-          // 56 - zip64 extensible data sector                                (variable size)
-          return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
-        });
-      }
+      // ZIP64 end of central directory record
+      var zip64EocdrBuffer = newBuffer(56);
+      return readAndAssertNoEof(reader, zip64EocdrBuffer, 0, zip64EocdrBuffer.length, zip64EocdrOffset, function(err) {
+        if (err) return callback(err);
 
-      // Not ZIP64 format
-      if (diskNumber !== 0) {
-        return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
-      }
-      return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
-
+        // 0 - zip64 end of central dir signature                           4 bytes  (0x06064b50)
+        if (zip64EocdrBuffer.readUInt32LE(0) !== 0x06064b50) {
+          return callback(new Error("invalid zip64 end of central directory record signature"));
+        }
+        // 4 - size of zip64 end of central directory record                8 bytes
+        // 12 - version made by                                             2 bytes
+        // 14 - version needed to extract                                   2 bytes
+        // 16 - number of this disk                                         4 bytes
+        diskNumber = zip64EocdrBuffer.readUInt32LE(16);
+        if (diskNumber !== 0) {
+          // Check this only after zip64 overrides. See #118.
+          return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
+        }
+        // 20 - number of the disk with the start of the central directory  4 bytes
+        // 24 - total number of entries in the central directory on this disk         8 bytes
+        // 32 - total number of entries in the central directory            8 bytes
+        entryCount = readUInt64LE(zip64EocdrBuffer, 32);
+        // 40 - size of the central directory                               8 bytes
+        // 48 - offset of start of central directory with respect to the starting disk number     8 bytes
+        centralDirectoryOffset = readUInt64LE(zip64EocdrBuffer, 48);
+        // 56 - zip64 extensible data sector                                (variable size)
+        return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
+      });
     }
 
-    // Not a zip file.
-    callback(new Error("End of central directory record signature not found. Either not a zip file, or file is truncated."));
+    // Not ZIP64 format
+    if (diskNumber !== 0) {
+      return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
+    }
+    return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
   });
 }
 
@@ -335,6 +349,9 @@ ZipFile.prototype._readEntry = function() {
 
     self.readEntryCursor += 46;
 
+    // absolute file offset of this entry's extra field, used to report ambiguous duplicate extra fields.
+    var extraFieldFileOffset = self.readEntryCursor + entry.fileNameLength;
+
     buffer = newBuffer(entry.fileNameLength + entry.extraFieldLength + entry.fileCommentLength);
     readAndAssertNoEof(self.reader, buffer, 0, buffer.length, self.readEntryCursor, function(err) {
       if (err) return emitErrorAndAutoClose(self, err);
@@ -358,7 +375,11 @@ ZipFile.prototype._readEntry = function() {
       if (self.decodeStrings) {
         var isUtf8 = (entry.generalPurposeBitFlag & 0x800) !== 0;
         entry.fileComment = decodeBuffer(entry.fileCommentRaw, isUtf8);
-        entry.fileName = getFileNameLowLevel(entry.generalPurposeBitFlag, entry.fileNameRaw, entry.extraFields, self.strictFileNames);
+        try {
+          entry.fileName = getFileNameLowLevel(entry.generalPurposeBitFlag, entry.fileNameRaw, entry.extraFields, self.strictFileNames);
+        } catch (err) {
+          return emitErrorAndAutoClose(self, err);
+        }
         var errorMessage = validateFileName(entry.fileName);
         if (errorMessage != null) return emitErrorAndAutoClose(self, new Error(errorMessage));
       } else {
@@ -371,13 +392,27 @@ ZipFile.prototype._readEntry = function() {
       self.readEntryCursor += buffer.length;
       self.entriesRead += 1;
 
-      // Check for the Zip64 Extended Information Extra Field.
+      // Check for the Zip64 Extended Information Extra Field (0x0001).
+      // The spec allows at most one per entry; a second one with different contents
+      // would make the entry's sizes and local header offset depend on which record
+      // a parser happens to pick, so conflicting duplicates are rejected outright.
+      var zip64EiefBuffers = [];
+      var zip64EiefOffsets = [];
       for (var i = 0; i < entry.extraFields.length; i++) {
         var extraField = entry.extraFields[i];
         if (extraField.id !== 0x0001) continue;
-        // Found it.
+        zip64EiefBuffers.push(extraField.data);
+        zip64EiefOffsets.push(extraFieldFileOffset + extraField.offset);
+      }
+      for (var i = 1; i < zip64EiefBuffers.length; i++) {
+        if (zip64EiefBuffers[i].equals(zip64EiefBuffers[0])) continue;
+        return emitErrorAndAutoClose(self, new Error(
+          "ambiguous entry: conflicting duplicate zip64 extended information extra fields at file offsets " +
+          zip64EiefOffsets[0] + " and " + zip64EiefOffsets[i]));
+      }
+      if (zip64EiefBuffers.length > 0) {
+        var zip64EiefBuffer = zip64EiefBuffers[0];
 
-        var zip64EiefBuffer = extraField.data;
         var index = 0;
         // 0 - Original Size          8 bytes
         if (entry.uncompressedSize === 0xffffffff) {
@@ -404,8 +439,6 @@ ZipFile.prototype._readEntry = function() {
           index += 8;
         }
         // 24 - Disk Start Number      4 bytes
-
-        break;
       }
 
       // validate file size
@@ -826,6 +859,7 @@ function dosDateTimeToDate(date, time, timezone) {
 
 function getFileNameLowLevel(generalPurposeBitFlag, fileNameBuffer, extraFields, strictFileNames) {
   var fileName = null;
+  var fileNameExtraFieldOffset = -1;
 
   // check for Info-ZIP Unicode Path Extra Field (0x7075)
   // see https://github.com/thejoshwolfe/yauzl/issues/33
@@ -850,8 +884,16 @@ function getFileNameLowLevel(generalPurposeBitFlag, fileNameBuffer, extraFields,
         continue;
       }
       // UnicodeName   Variable    UTF-8 version of the entry File Name
-      fileName = decodeBuffer(extraField.data.subarray(5), true);
-      break;
+      var unicodeName = decodeBuffer(extraField.data.subarray(5), true);
+      if (fileName !== null && unicodeName !== fileName) {
+        // multiple valid unicode path extra fields that disagree about the file name.
+        // different parsers pick the first or the last one, so this entry's identity
+        // is ambiguous; fail closed and report where the conflicting records live.
+        throw new Error("ambiguous entry: conflicting info-zip unicode path extra fields at extra field offsets " +
+          fileNameExtraFieldOffset + " and " + extraField.offset);
+      }
+      fileName = unicodeName;
+      fileNameExtraFieldOffset = extraField.offset;
     }
   }
 
@@ -895,6 +937,9 @@ function parseExtraFields(extraFieldBuffer) {
     extraFields.push({
       id: headerId,
       data: dataBuffer,
+      // offset of this field's header within the extra field buffer.
+      // useful for reporting the location of ambiguous duplicate fields.
+      offset: i,
     });
     i = dataEnd;
   }

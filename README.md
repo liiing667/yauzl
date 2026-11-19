@@ -273,8 +273,9 @@ This function is used internally by yauzl to compute [`entry.extraFields`](#extr
 It is exported in case you want to call it on [`localFileHeader.extraField`](#class-localfileheader).
 
 `extraFieldBuffer` is a `Buffer`, such as `localFileHeader.extraField`.
-Returns an `Array` with each item in the form `{id: id, data: data}`,
-where `id` is a `Number` and `data` is a `Buffer`.
+Returns an `Array` with each item in the form `{id: id, data: data, offset: offset}`,
+where `id` is a `Number`, `data` is a `Buffer`,
+and `offset` is the `Number` offset of the item's header within `extraFieldBuffer`.
 Throws an `Error` if the data encodes an item with a size that exceeds the bounds of the buffer.
 
 You may want to surround calls to this function with `try { ... } catch (err) { ... }` to handle the error.
@@ -597,11 +598,14 @@ Furthermore, no automatic file name validation is performed for this file name.
 
 #### extraFields
 
-`Array` with each item in the form `{id: id, data: data}`,
-where `id` is a `Number` and `data` is a `Buffer`.
+`Array` with each item in the form `{id: id, data: data, offset: offset}`,
+where `id` is a `Number`, `data` is a `Buffer`,
+and `offset` is the `Number` offset of the item's header within `extraFieldRaw`.
 
 This library looks for and reads the ZIP64 Extended Information Extra Field (0x0001)
 in order to support ZIP64 format zip files.
+If an entry contains multiple ZIP64 Extended Information Extra Fields with conflicting contents,
+an error is emitted instead of guessing which one to trust.
 
 This library also looks for and reads the Info-ZIP Unicode Path Extra Field (0x7075)
 in order to support some zipfiles that use it instead of General Purpose Bit 11
@@ -609,6 +613,8 @@ to convey `UTF-8` file names.
 When the field is identified and verified to be reliable (see the zipfile spec),
 the file name in this field is stored in the `fileName` property,
 and the file name in the central directory record for this entry is ignored.
+If multiple verified Unicode Path Extra Fields disagree about the file name,
+an error is emitted instead of guessing which one to trust.
 Note that when `decodeStrings` is false, all Info-ZIP Unicode Path Extra Fields are ignored.
 
 See also [`getLastModDate()`](#getlastmoddateoptions) for additional extra fields that are recognized by this library.
@@ -906,7 +912,7 @@ This library makes no attempt to interpret the Language Encoding Flag.
 
 The zip file specification has several ambiguities inherent in its design. Yikes!
 
-* The `.ZIP file comment` must not contain the `end of central dir signature` bytes `50 4b 05 06`. This corresponds to the text `"PK☺☻"` in CP437. While this is allowed by the specification, yauzl will hopefully reject this situation with an "Invalid comment length" error. However, in some situations unpredictable incorrect behavior will ensue, which will probably manifest in either an invalid signature error or some kind of bounds check error, such as "Unexpected EOF".
+* The `.ZIP file comment` must not contain the `end of central dir signature` bytes `50 4b 05 06`. This corresponds to the text `"PK☺☻"` in CP437. While this is allowed by the specification, yauzl rejects this situation. If the signature bytes in the comment form a second, self-consistent end of central directory record (a polyglot where different parsers would select different central directories), yauzl fails with an "ambiguous zip file" error reporting the file offsets of both candidate records; otherwise yauzl fails with an "Invalid comment length" error.
 * In non-ZIP64 files, the last central directory header must not have the bytes `50 4b 06 07` (`"PK♠•"` in CP437) exactly 20 bytes from its end, which might be in the `file name`, the `extra field`, or the `file comment`. The presence of these bytes indicates that this is a ZIP64 file.
 
 ## Change History
