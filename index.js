@@ -577,18 +577,43 @@ ZipFile.prototype.openReadStream = function(entry, options, callback) {
     return callback(new Error("unsupported compression method: " + entry.compressionMethod));
   }
 
+  // CRC-32 only authenticates the complete, decoded contents of an entry.
+  // Skip the check when the client is deliberately getting something else:
+  // a partial byte range, explicitly raw/encoded data, a deprecated raw
+  // decompress/decrypt bypass, or encrypted bytes that yauzl does not decode.
+  // A stored (compression method 0), unencrypted entry without a range still
+  // presents its complete decoded contents even though rawMode is true, so it
+  // is authenticated. An early cancel via readStream.destroy() aborts the
+  // check rather than reporting an error for an unfinished read.
+  var verifyCrc32 = (
+    self.validateEntrySizes &&
+    relativeStart === 0 &&
+    relativeEnd === entry.compressedSize &&
+    options.decodeFileData !== false &&
+    options.decompress == null &&
+    options.decrypt == null &&
+    !entry.isEncrypted()
+  );
+  var expectedCrc32 = verifyCrc32 ? entry.crc32 : null;
+
   self.readLocalFileHeader(entry, {minimal: true}, function(err, localFileHeader) {
     if (err) return callback(err);
     self.openReadStreamLowLevel(
       localFileHeader.fileDataStart, entry.compressedSize,
       relativeStart, relativeEnd,
-      decompress, entry.uncompressedSize,
+      decompress, entry.uncompressedSize, expectedCrc32,
       callback);
   });
 };
 
-ZipFile.prototype.openReadStreamLowLevel = function(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, callback) {
+ZipFile.prototype.openReadStreamLowLevel = function(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, expectedCrc32, callback) {
   var self = this;
+  // Backwards compatibility: this function used to take 7 arguments ending
+  // in `callback`. Accept the old calling convention in addition to the new one.
+  if (typeof expectedCrc32 === "function") {
+    callback = expectedCrc32;
+    expectedCrc32 = null;
+  }
 
   var fileDataEnd = fileDataStart + compressedSize;
   var readStream = self.reader.createReadStream({
@@ -596,36 +621,69 @@ ZipFile.prototype.openReadStreamLowLevel = function(fileDataStart, compressedSiz
     end: fileDataStart + relativeEnd,
   });
   var endpointStream = readStream;
-  if (decompress) {
-    var destroyed = false;
-    var inflateFilter = zlib.createInflateRaw();
-    readStream.on("error", function(err) {
+  var destroyed = false;
+  function forwardError(fromStream) {
+    fromStream.on("error", function(err) {
       // setImmediate here because errors can be emitted during the first call to pipe()
       setImmediate(function() {
-        if (!destroyed) inflateFilter.emit("error", err);
+        if (!destroyed) endpointStream.emit("error", err);
       });
     });
-    readStream.pipe(inflateFilter);
+  }
+
+  if (decompress) {
+    var inflateFilter = zlib.createInflateRaw();
+    var byteCounter = null;
+    var crc32Checker = null;
 
     if (self.validateEntrySizes) {
-      endpointStream = new AssertByteCountStream(uncompressedSize);
-      inflateFilter.on("error", function(err) {
-        // forward zlib errors to the client-visible stream
-        setImmediate(function() {
-          if (!destroyed) endpointStream.emit("error", err);
-        });
-      });
-      inflateFilter.pipe(endpointStream);
-    } else {
-      // the zlib filter is the client-visible stream
-      endpointStream = inflateFilter;
+      byteCounter = new AssertByteCountStream(uncompressedSize);
     }
+
+    if (expectedCrc32 != null) {
+      crc32Checker = new AssertCrc32Stream(expectedCrc32);
+    }
+
+    // Build the pipeline readStream -> inflate -> byte count -> CRC-32.
+    var pipeline = [readStream, inflateFilter];
+    readStream.pipe(inflateFilter);
+    if (byteCounter != null) {
+      inflateFilter.pipe(byteCounter);
+      pipeline.push(byteCounter);
+    }
+    if (crc32Checker != null) {
+      (byteCounter != null ? byteCounter : inflateFilter).pipe(crc32Checker);
+      pipeline.push(crc32Checker);
+    }
+    endpointStream = pipeline[pipeline.length - 1];
+
+    // Node's .pipe() propagates data and "end", but not "error". Forward
+    // errors from every upstream stage onto the client-visible endpoint so
+    // the whole pipeline reports failures on a single stream.
+    pipeline.forEach(function(stage) {
+      if (stage !== endpointStream) forwardError(stage);
+    });
+
     // this is part of yauzl's API, so implement this function on the client-visible stream
     installDestroyFn(endpointStream, function() {
       destroyed = true;
-      if (inflateFilter !== endpointStream) inflateFilter.unpipe(endpointStream);
+      if (crc32Checker != null && byteCounter != null) byteCounter.unpipe(crc32Checker);
+      if (byteCounter != null) inflateFilter.unpipe(byteCounter);
       readStream.unpipe(inflateFilter);
       // TODO: the inflateFilter may cause a memory leak. see Issue #27.
+      readStream.destroy();
+    });
+  } else if (expectedCrc32 != null) {
+    // Stored (compression method 0) data that yauzl is handing over decoded
+    // and complete. The CRC-32 runs incrementally over the streamed bytes,
+    // so no whole-entry buffering is required.
+    var storedCrc32Checker = new AssertCrc32Stream(expectedCrc32);
+    forwardError(readStream);
+    readStream.pipe(storedCrc32Checker);
+    endpointStream = storedCrc32Checker;
+    installDestroyFn(endpointStream, function() {
+      destroyed = true;
+      readStream.unpipe(storedCrc32Checker);
       readStream.destroy();
     });
   }
@@ -716,9 +774,9 @@ ZipFile.prototype.openReadStreamPromise = function(entry, options) {
     });
   });
 };
-ZipFile.prototype.openReadStreamLowLevelPromise = function(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize) {
+ZipFile.prototype.openReadStreamLowLevelPromise = function(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, expectedCrc32) {
   return new Promise((resolve, reject) => {
-    this.openReadStream(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, function(err, readStream) {
+    this.openReadStreamLowLevel(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, expectedCrc32, function(err, readStream) {
       if (err) return reject(err);
       resolve(readStream);
     });
@@ -933,6 +991,32 @@ AssertByteCountStream.prototype._flush = function(cb) {
   if (this.actualByteCount < this.expectedByteCount) {
     var msg = "not enough bytes in the stream. expected " + this.expectedByteCount + ". got only " + this.actualByteCount;
     return cb(new Error(msg));
+  }
+  cb();
+};
+
+// Verifies the entry's declared CRC-32 while data streams through.
+// The checksum is updated one chunk at a time, so entries of any size can be
+// authenticated without buffering the whole file. A mismatch is reported as
+// an error instead of a clean "end", which means downstream consumers cannot
+// mistake tampered (but same-length) data for a successful extraction.
+util.inherits(AssertCrc32Stream, Transform);
+function AssertCrc32Stream(expectedCrc32) {
+  Transform.call(this);
+  this.actualCrc32 = 0;
+  this.expectedCrc32 = expectedCrc32 >>> 0;
+}
+AssertCrc32Stream.prototype._transform = function(chunk, encoding, cb) {
+  this.actualCrc32 = crc32(chunk, this.actualCrc32);
+  cb(null, chunk);
+};
+AssertCrc32Stream.prototype._flush = function(cb) {
+  if (this.actualCrc32 !== this.expectedCrc32) {
+    var msg = "CRC-32 mismatch. expected " + this.expectedCrc32 + ". got " + this.actualCrc32;
+    // Defer so the error is emitted on a future tick, giving callers a chance
+    // to attach an "error" listener even when the underlying source ended
+    // synchronously (as can happen with fromBuffer()).
+    return setImmediate(function() { cb(new Error(msg)); });
   }
   cb();
 };

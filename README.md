@@ -403,6 +403,8 @@ When specifying `start` and/or `end`, it is recommended to unconditionally set `
 If either `start` and/or `end` are specified and non-`null`, then either `decodeFileData` must be set to `false`,
 or both `isEncrypted()` must return `false` and `compressionMethod` must be `0`.
 Specifying `{start: 0, end: entry.compressedSize}` will result in the complete file.
+Because a partial range does not represent the complete decoded entry, the CRC-32 check is not performed on range reads;
+read the full entry without a range to get CRC-32 authentication.
 
 For compatibility with versions of yauzl prior to 3.3.x, `start` and `end` can also be used
 when the deprecated `decompress` and `decrypt` options are used appropriately.
@@ -422,6 +424,15 @@ doing some heuristic checks on the size metadata and then watching out for the a
 Such heuristics are outside the scope of this library,
 but enforcing the `uncompressedSize` is implemented here as a security feature.
 
+When `validateEntrySizes` is `true` and the complete decoded entry is being read,
+yauzl also streams a CRC-32 checksum of the emitted bytes and compares it to the entry's declared `crc32`.
+A mismatch produces a `CRC-32 mismatch` error from the `readStream` instead of a clean `"end"` event,
+so corrupted or tampered data (even with an unchanged byte count) cannot be treated as a successful extraction.
+The checksum is computed incrementally per chunk, so no whole-entry buffering is required.
+The CRC-32 check is skipped for byte ranges, raw/encoded reads (`decodeFileData: false` or the deprecated
+`decompress`/`decrypt` bypasses), and encrypted entries, because those reads do not deliver the complete decoded contents.
+See [CRC-32 Content Authentication](#crc-32-content-authentication).
+
 It is possible to destroy the `readStream` before it has piped all of its data.
 To do this, call `readStream.destroy()`.
 You must `unpipe()` the `readStream` from any destination before calling `readStream.destroy()`.
@@ -429,6 +440,8 @@ If this zipfile was created using `fromRandomAccessReader()`, the `RandomAccessR
 must provide readable streams that implement a `._destroy()` method according to
 https://nodejs.org/api/stream.html#writable_destroyerr-callback (see `randomAccessReader._readStreamForRange()`)
 in order for calls to `readStream.destroy()` to work in this context.
+Destroying the stream cancels the read and any in-flight integrity checks (including the CRC-32);
+neither an `"end"` event nor an integrity error is emitted for the cancelled data.
 
 #### readLocalFileHeader(entry, [options], callback)
 
@@ -456,7 +469,7 @@ and yauzl internally effectively uses the `{minimal: true}` option as part of `o
 The `callback` receives `(err, localFileHeaderOrAnObjectWithJustOneFieldDependingOnTheMinimalOption)`,
 where the type of the second parameter is described in the above discussion of the `minimal` option.
 
-#### openReadStreamLowLevel(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, callback)
+#### openReadStreamLowLevel(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, [expectedCrc32], callback)
 
 This is a low-level function available for advanced use cases. You probably want `openReadStream()` instead.
 
@@ -473,13 +486,14 @@ The parameters are all integers and booleans, which are friendly to serializatio
 * `relativeEnd` - the resolved value of `options.end` from `openReadStream()`. Must be a non-negative integer, not `null`. Typically `entry.compressedSize` to include all the data.
 * `decompress` - boolean indicating whether the data should be piped through a zlib inflate stream.
 * `uncompressedSize` - from `entry.uncompressedSize`. Only used when `validateEntrySizes` is `true`. If `validateEntrySizes` is `false`, this value is ignored, but must still be present, not omitted, in the arguments; you have to give it some value, even if it's `null`.
+* `expectedCrc32` - optional. The `entry.crc32` of the complete decoded entry. When provided, the stream increments a CRC-32 over the emitted bytes and emits a `CRC-32 mismatch` error instead of `"end"` if the checksum does not match. Pass `null`, or omit it using the legacy 7-argument calling convention where `callback` is the 7th argument, to skip CRC-32 authentication (for example for byte ranges or raw/encoded reads).
 * `callback` - receives `(err, readStream)`, the same as for `openReadStream()`
 
 This low-level function does not read any metadata from the underlying storage before opening the read stream.
 This is both a performance feature and a safety hazard.
 None of the integer parameters are bounds checked.
 None of the validation from `openReadStream()` with respect to compression and encryption is done here either.
-Only the bounds checks from `validateEntrySizes` are done, because that is part of processing the stream data.
+Only the bounds checks from `validateEntrySizes`, and the CRC-32 check when an `expectedCrc32` is supplied, are done, because those are part of processing the stream data.
 
 #### openReadStreamPromise(entry, [options])
 
@@ -497,13 +511,13 @@ otherwise the promise is resolved with the `readStream`.
 
 `entry` and `options` are passed directly to `readLocalFileHeader()`.
 
-#### openReadStreamLowLevelPromise(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize)
+#### openReadStreamLowLevelPromise(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, [expectedCrc32])
 
 Wraps `openReadStreamLowLevel()` with `Promise` semantics.
 The returned promise is rejected if the `callback` for `openReadStreamLowLevel()` receives an `err`,
 otherwise the promise is resolved with the `readStream`.
 
-All arguments, `fileDataStart`, `compressedSize`, `relativeStart`, `relativeEnd`, `decompress`, and `uncompressedSize`, are passed directly to `openReadStreamLowLevel()`.
+All arguments, `fileDataStart`, `compressedSize`, `relativeStart`, `relativeEnd`, `decompress`, `uncompressedSize`, and the optional `expectedCrc32`, are passed directly to `openReadStreamLowLevel()`.
 
 #### close()
 
@@ -869,10 +883,32 @@ This data is officially defined to be redundant with the Central Directory infor
 and is not to be trusted.
 Aside from checking the signature, yauzl ignores the content of the Local File Header.
 
-### No CRC-32 Checking
+### CRC-32 Content Authentication
 
-This library provides the `crc32` field of `Entry` objects read from the Central Directory.
-However, this field is not used for anything in this library.
+This library reads the `crc32` field of `Entry` objects from the Central Directory and,
+by default, uses it to authenticate the contents streamed out of `openReadStream()`.
+The checksum is updated incrementally as each chunk flows through the pipeline,
+so entries of any size are verified without buffering the whole file in memory.
+
+When the complete, decoded entry data has been streamed and the running CRC-32 does not match
+the value declared in the Central Directory,
+the `readStream` emits an `"error"` event (with a `CRC-32 mismatch` message) instead of `"end"`.
+This means tampered data whose length happens to be unchanged cannot be mistaken for a successful extraction.
+
+The CRC-32 only authenticates the complete, decoded contents of an entry,
+so the check is skipped (without an error) in these cases, where the client is deliberately reading something other than the full decoded file:
+
+ * A byte range was requested with `options.start` and/or `options.end`.
+ * Raw, still-encoded bytes were requested with `options.decodeFileData === false`
+   (or the deprecated `options.decompress === false` / `options.decrypt === false` bypasses).
+ * The entry is encrypted, in which case yauzl only provides the raw encrypted bytes.
+
+Calling `readStream.destroy()` before the stream finishes cancels the read early;
+the CRC-32 check is aborted along with the rest of the pipeline rather than reported as a failure.
+
+The check is also skipped when `validateEntrySizes` is `false`,
+which opts out of all of yauzl's stream-level integrity checks.
+In that case the `crc32` field is still provided on `Entry` objects so callers can verify the data themselves.
 
 ### versionNeededToExtract Is Ignored
 
@@ -911,6 +947,11 @@ The zip file specification has several ambiguities inherent in its design. Yikes
 
 ## Change History
 
+ * 3.5.0
+   * `openReadStream()` now verifies each entry's declared CRC-32 while streaming the complete decoded contents, emitting a `CRC-32 mismatch` error instead of a clean `"end"` for corrupted or tampered data. The checksum is computed incrementally, so large entries are authenticated without whole-file buffering.
+   * Document and enforce explicit semantics for early `readStream.destroy()` (the read and integrity checks are cancelled), byte-range reads (no CRC-32 check), and raw mode via `decodeFileData: false` or the deprecated `decompress`/`decrypt` bypasses (raw/encoded bytes are returned without a CRC-32 verdict). Encrypted entries remain raw and unverified.
+   * Add an optional `expectedCrc32` parameter to `openReadStreamLowLevel()` and `openReadStreamLowLevelPromise()`. The legacy 7-argument low-level calling convention remains supported.
+   * Fix `openReadStreamLowLevelPromise()` to call `openReadStreamLowLevel()` instead of `openReadStream()`.
  * 3.4.0
    * Add wrapper functions that give Promise semantics: `openPromise()`, `fromFdPromise()`, `fromBufferPromise()`, `fromRandomAccessReaderPromise()`, `openReadStreamPromise()`, `readLocalFileHeaderPromise()`, `openReadStreamLowLevelPromise()`. [pull #171](https://github.com/thejoshwolfe/yauzl/pull/171)
    * Add `eachEntry()`, which gives async iterator semantics as an alternative to `readEntry()`, `Event: "entry"`, `Event: "end"`, and `Event: "error"`.

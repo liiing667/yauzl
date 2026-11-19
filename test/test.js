@@ -1,6 +1,7 @@
 var yauzl = require("../");
 var zip64 = require("./zip64");
 var rangeTest = require("./range-test");
+var crc32Test = require("./crc32-test");
 var errorsTest = require("./errors");
 var fs = require("fs");
 var path = require("path");
@@ -441,6 +442,9 @@ pend.go(zip64.runTest);
 
 // openReadStream with range
 pend.go(rangeTest.runTest);
+
+// streaming CRC-32 content authentication and related stream semantics
+pend.go(crc32Test.runTest);
 
 // Test error propagation.
 pend.go(errorsTest.runTest);

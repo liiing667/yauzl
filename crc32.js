@@ -34,8 +34,11 @@ const CRC_TABLE = new Int32Array([
   0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
 ]);
 
-function crc32(buf) {
-  let crc = -1;
+function crc32(buf, previousCrc32) {
+  // Accept the finalized (unsigned) CRC of preceding chunks, matching the
+  // signature of Node's zlib.crc32(data, value). Omit the second argument (or
+  // pass 0) to start a fresh checksum.
+  let crc = previousCrc32 == null ? -1 : (previousCrc32 ^ -1);
   for (let x of buf) {
     crc = CRC_TABLE[(crc ^ x) & 0xff] ^ (crc >>> 8);
   }
