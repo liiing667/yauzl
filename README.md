@@ -563,6 +563,7 @@ These fields are of type `Number`:
  * `fileNameLength` (in bytes)
  * `extraFieldLength` (in bytes)
  * `fileCommentLength` (in bytes)
+ * `diskNumberStart`
  * `internalFileAttributes`
  * `externalFileAttributes`
  * `relativeOffsetOfLocalHeader`

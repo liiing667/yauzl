@@ -324,6 +324,7 @@ ZipFile.prototype._readEntry = function() {
     // 32 - File comment length (k)
     entry.fileCommentLength = buffer.readUInt16LE(32);
     // 34 - Disk number where file starts
+    entry.diskNumberStart = buffer.readUInt16LE(34);
     // 36 - Internal file attributes
     entry.internalFileAttributes = buffer.readUInt16LE(36);
     // 38 - External file attributes
@@ -404,8 +405,21 @@ ZipFile.prototype._readEntry = function() {
           index += 8;
         }
         // 24 - Disk Start Number      4 bytes
+        if (entry.diskNumberStart === 0xffff) {
+          if (index + 4 > zip64EiefBuffer.length) {
+            return emitErrorAndAutoClose(self, new Error("zip64 extended information extra field does not include disk start number"));
+          }
+          entry.diskNumberStart = zip64EiefBuffer.readUInt32LE(index);
+          index += 4;
+        }
 
         break;
+      }
+
+      // Multi-disk archives are not supported. The end of central directory record
+      // claims this is a single-disk archive, so every entry must start on disk 0.
+      if (entry.diskNumberStart !== 0) {
+        return emitErrorAndAutoClose(self, new Error("multi-disk zip files are not supported: found disk number start: " + entry.diskNumberStart));
       }
 
       // validate file size
