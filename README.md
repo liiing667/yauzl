@@ -91,7 +91,7 @@ Calls `fs.open(path, "r")` and reads the `fd` effectively the same as `fromFd()`
 
 See also `openPromise()` to get `Promise` semantics.
 
-`options` may be omitted or `null`. The defaults are `{autoClose: true, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false}`.
+`options` may be omitted or `null`. The defaults are `{autoClose: true, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, maxTotalUncompressedSize: Infinity, maxCompressionRatio: Infinity}`.
 
 `autoClose` is effectively equivalent to:
 
@@ -121,6 +121,26 @@ This check happens as early as possible, which is either before emitting each `"
 or during the `readStream` piping after calling `openReadStream()`.
 See `openReadStream()` for more information on defending against zip bomb attacks.
 
+`maxTotalUncompressedSize` limits the total number of uncompressed bytes
+that a single `zipfile` session is allowed to produce across all entries.
+The budget is enforced twice:
+when an entry's metadata is read, its declared `uncompressedSize` is added to a session-wide tally,
+and the `zipfile` emits an `error` (instead of the `"entry"` event) if the tally exceeds the limit;
+and while a `readStream` from `openReadStream()` is piping decompressed data,
+the actual emitted bytes are counted against the same limit,
+and exceeding it cancels the decompression mid-stream with an `error` on the `readStream` and on the `zipfile`.
+When the budget is exceeded, the `zipfile` session fails and will not emit `"end"`.
+The default `Infinity` disables this check.
+
+`maxCompressionRatio` limits the ratio of uncompressed to compressed size (`uncompressedSize / compressedSize`)
+for each compressed entry.
+Like `maxTotalUncompressedSize`, this is enforced both against the declared size metadata
+before each `"entry"` event is emitted, and against the actual decompressed byte count
+while the `readStream` is piping, cancelling the decompression mid-stream if the limit is exceeded.
+This is useful for stopping [zip bomb](http://en.wikipedia.org/wiki/Zip_bomb) attacks
+where a small archive expands into an unreasonable amount of output.
+The default `Infinity` disables this check.
+
 When `strictFileNames` is `false` (the default) and `decodeStrings` is `true`,
 all backslash (`\`) characters in each `entry.fileName` are replaced with forward slashes (`/`).
 The spec forbids file names with backslashes,
@@ -145,7 +165,7 @@ so the fd cannot be an open socket or any other fd that does not support random 
 
 See also `fromFdPromise()` to get `Promise` semantics.
 
-`options` may be omitted or `null`. The defaults are `{autoClose: false, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false}`.
+`options` may be omitted or `null`. The defaults are `{autoClose: false, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, maxTotalUncompressedSize: Infinity, maxCompressionRatio: Infinity}`.
 
 See `open()` for the meaning of the options and callback.
 
@@ -160,7 +180,7 @@ If a `ZipFile` is acquired from this method,
 it will never emit the `close` event,
 and calling `close()` is not necessary.
 
-`options` may be omitted or `null`. The defaults are `{lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false}`.
+`options` may be omitted or `null`. The defaults are `{lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, maxTotalUncompressedSize: Infinity, maxCompressionRatio: Infinity}`.
 
 See `open()` for the meaning of the options and callback.
 The `autoClose` option is ignored for this method.
@@ -176,7 +196,7 @@ The `reader` parameter must be of a type that is a subclass of
 [RandomAccessReader](#class-randomaccessreader) that implements the required methods.
 The `totalSize` is a Number and indicates the total file size of the zip file.
 
-`options` may be omitted or `null`. The defaults are `{autoClose: true, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false}`.
+`options` may be omitted or `null`. The defaults are `{autoClose: true, lazyEntries: false, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, maxTotalUncompressedSize: Infinity, maxCompressionRatio: Infinity}`.
 
 See `open()` for the meaning of the options and callback.
 
@@ -417,10 +437,12 @@ yauzl notices this false information and emits an error from the `readStream`
 after some number of bytes have already been piped through the stream.
 
 This check allows clients to trust the `uncompressedSize` field in `Entry` objects.
-Guarding against [zip bomb](http://en.wikipedia.org/wiki/Zip_bomb) attacks can be accomplished by
-doing some heuristic checks on the size metadata and then watching out for the above errors.
-Such heuristics are outside the scope of this library,
-but enforcing the `uncompressedSize` is implemented here as a security feature.
+Guarding against [zip bomb](http://en.wikipedia.org/wiki/Zip_bomb) attacks can be accomplished
+with the `maxTotalUncompressedSize` and `maxCompressionRatio` options (see `open()`),
+which enforce a session-wide expansion budget both against the declared size metadata
+and against the actual decompressed bytes while the `readStream` is piping.
+When either limit is exceeded, the `readStream` emits an `error`, the decompression is cancelled,
+and the `zipfile` session fails instead of reaching a completed state.
 
 It is possible to destroy the `readStream` before it has piped all of its data.
 To do this, call `readStream.destroy()`.

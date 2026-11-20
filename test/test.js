@@ -2,6 +2,7 @@ var yauzl = require("../");
 var zip64 = require("./zip64");
 var rangeTest = require("./range-test");
 var errorsTest = require("./errors");
+var budgetTest = require("./budget");
 var fs = require("fs");
 var path = require("path");
 var Pend = require("pend");
@@ -444,6 +445,9 @@ pend.go(rangeTest.runTest);
 
 // Test error propagation.
 pend.go(errorsTest.runTest);
+
+// Test the session expansion budget.
+pend.go(budgetTest.runTest);
 
 // Make sure the examples run without crashing.
 pend.go(function(cb) {

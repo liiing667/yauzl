@@ -128,6 +128,10 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
   var decodeStrings = !!options.decodeStrings;
   if (options.validateEntrySizes == null) options.validateEntrySizes = true;
   if (options.strictFileNames == null) options.strictFileNames = false;
+  if (options.maxTotalUncompressedSize == null) options.maxTotalUncompressedSize = Infinity;
+  if (options.maxCompressionRatio == null) options.maxCompressionRatio = Infinity;
+  validateBudgetOption("maxTotalUncompressedSize", options.maxTotalUncompressedSize);
+  validateBudgetOption("maxCompressionRatio", options.maxCompressionRatio);
   if (callback == null) callback = defaultCallback;
   if (typeof totalSize !== "number") throw new Error("expected totalSize parameter to be a number");
   if (totalSize > Number.MAX_SAFE_INTEGER) {
@@ -213,7 +217,7 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
           // 48 - offset of start of central directory with respect to the starting disk number     8 bytes
           centralDirectoryOffset = readUInt64LE(zip64EocdrBuffer, 48);
           // 56 - zip64 extensible data sector                                (variable size)
-          return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
+          return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames, options.maxTotalUncompressedSize, options.maxCompressionRatio));
         });
       }
 
@@ -221,7 +225,7 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
       if (diskNumber !== 0) {
         return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
       }
-      return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
+      return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames, options.maxTotalUncompressedSize, options.maxCompressionRatio));
 
     }
 
@@ -231,7 +235,7 @@ function fromRandomAccessReader(reader, totalSize, options, callback) {
 }
 
 util.inherits(ZipFile, EventEmitter);
-function ZipFile(reader, centralDirectoryOffset, fileSize, entryCount, comment, autoClose, lazyEntries, decodeStrings, validateEntrySizes, strictFileNames) {
+function ZipFile(reader, centralDirectoryOffset, fileSize, entryCount, comment, autoClose, lazyEntries, decodeStrings, validateEntrySizes, strictFileNames, maxTotalUncompressedSize, maxCompressionRatio) {
   var self = this;
   EventEmitter.call(self);
   self.reader = reader;
@@ -253,6 +257,10 @@ function ZipFile(reader, centralDirectoryOffset, fileSize, entryCount, comment, 
   self.decodeStrings = !!decodeStrings;
   self.validateEntrySizes = !!validateEntrySizes;
   self.strictFileNames = !!strictFileNames;
+  self.maxTotalUncompressedSize = maxTotalUncompressedSize;
+  self.maxCompressionRatio = maxCompressionRatio;
+  self.totalDeclaredUncompressedSize = 0;
+  self.totalEmittedUncompressedSize = 0;
   self.isOpen = true;
   self.emittedError = false;
   self.hasEachEntryBeenCalled = false;
@@ -421,6 +429,13 @@ ZipFile.prototype._readEntry = function() {
         }
       }
 
+      // Enforce the expansion budget against the declared metadata
+      // before the entry is exposed to the client.
+      var budgetErrorMessage = self.checkDeclaredEntryBudget(entry);
+      if (budgetErrorMessage != null) {
+        return emitErrorAndAutoClose(self, new Error(budgetErrorMessage));
+      }
+
       self.emit("entry", entry);
 
       if (!self.lazyEntries) self._readEntry();
@@ -428,6 +443,26 @@ ZipFile.prototype._readEntry = function() {
   });
 };
 
+// Checks the entry's declared metadata against the session expansion budget.
+// Returns an error message string if the budget is exceeded, or null if the entry is within budget.
+ZipFile.prototype.checkDeclaredEntryBudget = function(entry) {
+  var self = this;
+  self.totalDeclaredUncompressedSize += entry.uncompressedSize;
+  if (self.totalDeclaredUncompressedSize > self.maxTotalUncompressedSize) {
+    return "cumulative declared uncompressed size exceeds maxTotalUncompressedSize: " +
+      self.totalDeclaredUncompressedSize + " > " + self.maxTotalUncompressedSize;
+  }
+  if (entry.isCompressed() && entry.uncompressedSize > entry.compressedSize * self.maxCompressionRatio) {
+    return "declared compression ratio exceeds maxCompressionRatio for entry: " + entry.fileName +
+      " (" + entry.uncompressedSize + " / " + entry.compressedSize + " > " + self.maxCompressionRatio + ")";
+  }
+  return null;
+};
+// Called when a read stream exceeds the expansion budget mid-decompression.
+// The session must not be allowed to reach a completed state after this.
+ZipFile.prototype.budgetExceeded = function(err) {
+  emitErrorAndAutoClose(this, err);
+};
 ZipFile.prototype.eachEntry = function() {
   const self = this;
   if (!self.lazyEntries) throw new Error("eachEntry() requires lazyEntries: true");
@@ -620,11 +655,23 @@ ZipFile.prototype.openReadStreamLowLevel = function(fileDataStart, compressedSiz
       // the zlib filter is the client-visible stream
       endpointStream = inflateFilter;
     }
+    if (self.maxTotalUncompressedSize !== Infinity || self.maxCompressionRatio !== Infinity) {
+      // enforce the session expansion budget on the actual decompressed bytes
+      var budgetStream = new ExpansionBudgetStream(self, compressedSize);
+      endpointStream.on("error", function(err) {
+        // forward errors to the client-visible stream
+        setImmediate(function() {
+          if (!destroyed) budgetStream.emit("error", err);
+        });
+      });
+      endpointStream.pipe(budgetStream);
+      endpointStream = budgetStream;
+    }
     // this is part of yauzl's API, so implement this function on the client-visible stream
     installDestroyFn(endpointStream, function() {
       destroyed = true;
-      if (inflateFilter !== endpointStream) inflateFilter.unpipe(endpointStream);
       readStream.unpipe(inflateFilter);
+      inflateFilter.unpipe();
       // TODO: the inflateFilter may cause a memory leak. see Issue #27.
       readStream.destroy();
     });
@@ -936,6 +983,40 @@ AssertByteCountStream.prototype._flush = function(cb) {
   }
   cb();
 };
+
+util.inherits(ExpansionBudgetStream, Transform);
+function ExpansionBudgetStream(zipfile, compressedSize) {
+  Transform.call(this);
+  this.zipfile = zipfile;
+  this.compressedSize = compressedSize;
+  this.entryByteCount = 0;
+}
+ExpansionBudgetStream.prototype._transform = function(chunk, encoding, cb) {
+  var zipfile = this.zipfile;
+  this.entryByteCount += chunk.length;
+  zipfile.totalEmittedUncompressedSize += chunk.length;
+  var err = null;
+  if (zipfile.totalEmittedUncompressedSize > zipfile.maxTotalUncompressedSize) {
+    err = new Error("cumulative uncompressed size exceeds maxTotalUncompressedSize: " +
+      zipfile.totalEmittedUncompressedSize + " > " + zipfile.maxTotalUncompressedSize);
+  } else if (this.entryByteCount > this.compressedSize * zipfile.maxCompressionRatio) {
+    err = new Error("compression ratio exceeds maxCompressionRatio: " +
+      this.entryByteCount + " / " + this.compressedSize + " > " + zipfile.maxCompressionRatio);
+  }
+  if (err != null) {
+    // Fail the whole session so it cannot reach a completed state,
+    // and error this stream to cancel the decompression pipeline.
+    zipfile.budgetExceeded(err);
+    return cb(err);
+  }
+  cb(null, chunk);
+};
+
+function validateBudgetOption(name, value) {
+  if (typeof value !== "number" || isNaN(value) || value < 0) {
+    throw new Error("invalid options." + name + ": " + value);
+  }
+}
 
 util.inherits(RandomAccessReader, EventEmitter);
 function RandomAccessReader() {
